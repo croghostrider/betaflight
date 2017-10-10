@@ -58,7 +58,6 @@
 
 #include "platform.h"
 
-
 #ifdef TELEMETRY
 
 #include "build/build_config.h"
@@ -66,24 +65,30 @@
 
 #include "common/axis.h"
 #include "common/time.h"
+#include "common/utils.h"
 
+#include "config/parameter_group.h"
+#include "config/parameter_group_ids.h"
 #include "drivers/serial.h"
 #include "drivers/time.h"
+#include "drivers/system.h"
+
+#include "io/serial.h"
 
 #include "fc/runtime_config.h"
 
-#include "flight/altitude.h"
-#include "flight/pid.h"
-#include "flight/navigation.h"
-
-#include "io/gps.h"
-
+#include "sensors/sensors.h"
 #include "sensors/battery.h"
 #include "sensors/barometer.h"
-#include "sensors/sensors.h"
 
-#include "telemetry/hott.h"
+#include "flight/pid.h"
+#include "flight/navigation.h"
+#include "io/gps.h"
+
+#include "flight/altitude.h"
+
 #include "telemetry/telemetry.h"
+#include "telemetry/hott.h"
 
 //#define HOTT_DEBUG
 
@@ -105,7 +110,7 @@ static uint8_t hottMsgCrc;
 #define HOTT_CRC_SIZE (sizeof(hottMsgCrc))
 
 #define HOTT_BAUDRATE 19200
-#define HOTT_PORT_MODE MODE_RXTX // must be opened in RXTX so that TX and RX pins are allocated.
+#define HOTT_INITIAL_PORT_MODE MODE_RX
 
 static serialPort_t *hottPort = NULL;
 static serialPortConfig_t *portConfig;
@@ -209,7 +214,7 @@ void hottPrepareGPSResponse(HOTT_GPS_MSG_t *hottGPSMessage)
         altitude = getEstimatedAltitude() / 100;
     }
 
-    const uint16_t hottGpsAltitude = (altitude) + HOTT_GPS_ALTITUDE_OFFSET; // gpsSol.llh.alt in m ; offset = 500 -> O m
+    const uint16_t hottGpsAltitude = (altitude) + HOTT_GPS_ALTITUDE_OFFSET; // GPS_altitude in m ; offset = 500 -> O m
 
     hottGPSMessage->altitude_L = hottGpsAltitude & 0x00FF;
     hottGPSMessage->altitude_H = hottGpsAltitude >> 8;
@@ -225,13 +230,16 @@ static bool shouldTriggerBatteryAlarmNow(void)
 
 static inline void updateAlarmBatteryStatus(HOTT_EAM_MSG_t *hottEAMMessage)
 {
-    if (shouldTriggerBatteryAlarmNow()) {
+    batteryState_e batteryState;
+
+    if (shouldTriggerBatteryAlarmNow()){
         lastHottAlarmSoundTime = millis();
-        const batteryState_e batteryState = getBatteryState();
-        if (batteryState == BATTERY_WARNING  || batteryState == BATTERY_CRITICAL) {
+        batteryState = getBatteryState();
+        if (batteryState == BATTERY_WARNING  || batteryState == BATTERY_CRITICAL){
             hottEAMMessage->warning_beeps = 0x10;
             hottEAMMessage->alarm_invers1 = HOTT_EAM_ALARM1_FLAG_BATTERY_1;
-        } else {
+        }
+        else {
             hottEAMMessage->warning_beeps = HOTT_EAM_ALARM1_FLAG_NONE;
             hottEAMMessage->alarm_invers1 = HOTT_EAM_ALARM1_FLAG_NONE;
         }
@@ -250,14 +258,14 @@ static inline void hottEAMUpdateBattery(HOTT_EAM_MSG_t *hottEAMMessage)
 
 static inline void hottEAMUpdateCurrentMeter(HOTT_EAM_MSG_t *hottEAMMessage)
 {
-    const int32_t amp = getAmperage() / 10;
+    int32_t amp = getAmperage() / 10;
     hottEAMMessage->current_L = amp & 0xFF;
     hottEAMMessage->current_H = amp >> 8;
 }
 
 static inline void hottEAMUpdateBatteryDrawnCapacity(HOTT_EAM_MSG_t *hottEAMMessage)
 {
-    const int32_t mAh = getMAhDrawn() / 10;
+    int32_t mAh = getMAhDrawn() / 10;
     hottEAMMessage->batt_cap_L = mAh & 0xFF;
     hottEAMMessage->batt_cap_H = mAh >> 8;
 }
@@ -272,10 +280,10 @@ static inline void hottEAMUpdateAltitude(HOTT_EAM_MSG_t *hottEAMMessage)
 
 static inline void hottEAMUpdateClimbrate(HOTT_EAM_MSG_t *hottEAMMessage)
 {
-    const int32_t vario = getEstimatedVario();
+    int32_t vario = getEstimatedVario();
     hottEAMMessage->climbrate_L = (30000 + vario) & 0x00FF;
     hottEAMMessage->climbrate_H = (30000 + vario) >> 8;
-    hottEAMMessage->climbrate3s = 120 + (vario / 100);
+    hottEAMMessage->climbrate3s = 120 + (vario / 100);  
 }
 
 void hottPrepareEAMResponse(HOTT_EAM_MSG_t *hottEAMMessage)
@@ -313,95 +321,24 @@ void initHoTTTelemetry(void)
     initialiseMessages();
 }
 
-static void flushHottRxBuffer(void)
-{
-    while (serialRxBytesWaiting(hottPort) > 0) {
-        serialRead(hottPort);
-    }
-}
-
-static void workAroundForHottTelemetryOnUsart(serialPort_t *instance, portMode_e mode)
-{
-    closeSerialPort(hottPort);
-
-    portOptions_e portOptions = telemetryConfig()->telemetry_inverted ? SERIAL_INVERTED : SERIAL_NOT_INVERTED;
-
-    if (telemetryConfig()->halfDuplex) {
-        portOptions |= SERIAL_BIDIR;
-    }
-
-    hottPort = openSerialPort(instance->identifier, FUNCTION_TELEMETRY_HOTT, NULL, HOTT_BAUDRATE, mode, portOptions);
-}
-
-static bool hottIsUsingHardwareUART(void)
-{
-    return !(portConfig->identifier == SERIAL_PORT_SOFTSERIAL1 || portConfig->identifier == SERIAL_PORT_SOFTSERIAL2);
-}
-
-static void hottConfigurePortForTX(void)
-{
-    // FIXME temorary workaround for HoTT not working on Hardware serial ports due to hardware/softserial serial port initialisation differences
-    if (hottIsUsingHardwareUART()) {
-        workAroundForHottTelemetryOnUsart(hottPort, MODE_TX);
-    } else {
-        serialSetMode(hottPort, MODE_TX);
-    }
-}
-
-static void hottConfigurePortForRX(void)
-{
-    // FIXME temorary workaround for HoTT not working on Hardware serial ports due to hardware/softserial serial port initialisation differences
-    if (hottIsUsingHardwareUART()) {
-        workAroundForHottTelemetryOnUsart(hottPort, MODE_RX);
-    } else {
-        serialSetMode(hottPort, MODE_RX);
-    }
-    flushHottRxBuffer();
-}
-
-static void hottReconfigurePort(void)
-{
-    if (!hottIsSending) {
-        hottIsSending = true;
-        hottMsgCrc = 0;
-        hottConfigurePortForTX();
-        return;
-    }
-
-    if (hottMsgRemainingBytesToSendCount == 0) {
-        hottMsg = NULL;
-        hottIsSending = false;
-        hottConfigurePortForRX();
-        return;
-    }
-}
-
 void configureHoTTTelemetryPort(void)
 {
     if (!portConfig) {
         return;
     }
 
-    portOptions_e portOptions = SERIAL_NOT_INVERTED;
-
-    if (telemetryConfig()->halfDuplex) {
-        portOptions |= SERIAL_BIDIR;
-    }
-
-    hottPort = openSerialPort(portConfig->identifier, FUNCTION_TELEMETRY_HOTT, NULL, HOTT_BAUDRATE, HOTT_PORT_MODE, portOptions);
+    hottPort = openSerialPort(portConfig->identifier, FUNCTION_TELEMETRY_HOTT, NULL, HOTT_BAUDRATE, HOTT_INITIAL_PORT_MODE, SERIAL_NOT_INVERTED);
 
     if (!hottPort) {
         return;
     }
-
-    hottConfigurePortForRX();
 
     hottTelemetryEnabled = true;
 }
 
 static void hottSendResponse(uint8_t *buffer, int length)
 {
-    if (hottIsSending) {
+    if(hottIsSending) {
         return;
     }
 
@@ -426,8 +363,7 @@ static void hottPrepareMessages(void) {
 #endif
 }
 
-static void processBinaryModeRequest(uint8_t address)
-{
+static void processBinaryModeRequest(uint8_t address) {
 
 #ifdef HOTT_DEBUG
     static uint8_t hottBinaryRequests = 0;
@@ -437,22 +373,23 @@ static void processBinaryModeRequest(uint8_t address)
 
     switch (address) {
 #ifdef GPS
-    case 0x8A:
+        case 0x8A:
 #ifdef HOTT_DEBUG
-        hottGPSRequests++;
+            hottGPSRequests++;
 #endif
-        if (sensors(SENSOR_GPS)) {
-            hottSendGPSResponse();
-        }
-        break;
+            if (sensors(SENSOR_GPS)) {
+                hottSendGPSResponse();
+            }
+            break;
 #endif
-    case 0x8E:
+        case 0x8E:
 #ifdef HOTT_DEBUG
-        hottEAMRequests++;
+            hottEAMRequests++;
 #endif
-        hottSendEAMResponse();
-        break;
+            hottSendEAMResponse();
+            break;
     }
+
 
 #ifdef HOTT_DEBUG
     hottBinaryRequests++;
@@ -462,13 +399,21 @@ static void processBinaryModeRequest(uint8_t address)
 #endif
     debug[2] = hottEAMRequests;
 #endif
+
+}
+
+static void flushHottRxBuffer(void)
+{
+    while (serialRxBytesWaiting(hottPort) > 0) {
+        serialRead(hottPort);
+    }
 }
 
 static void hottCheckSerialData(uint32_t currentMicros)
 {
     static bool lookingForRequest = true;
 
-    const uint8_t bytesWaiting = serialRxBytesWaiting(hottPort);
+    uint8_t bytesWaiting = serialRxBytesWaiting(hottPort);
 
     if (bytesWaiting <= 1) {
         return;
@@ -493,8 +438,8 @@ static void hottCheckSerialData(uint32_t currentMicros)
         lookingForRequest = true;
     }
 
-    const uint8_t requestId = serialRead(hottPort);
-    const uint8_t address = serialRead(hottPort);
+    uint8_t requestId = serialRead(hottPort);
+    uint8_t address = serialRead(hottPort);
 
     if ((requestId == 0) || (requestId == HOTT_BINARY_MODE_REQUEST_ID) || (address == HOTT_TELEMETRY_NO_SENSOR_ID)) {
     /*
@@ -508,12 +453,37 @@ static void hottCheckSerialData(uint32_t currentMicros)
     }
 }
 
-static void hottSendTelemetryData(void) {
+static void workAroundForHottTelemetryOnUsart(serialPort_t *instance, portMode_e mode) {
+    closeSerialPort(hottPort);
+    hottPort = openSerialPort(instance->identifier, FUNCTION_TELEMETRY_HOTT, NULL, HOTT_BAUDRATE, mode, SERIAL_NOT_INVERTED);
+}
 
-    hottReconfigurePort();
+static void hottSendTelemetryData(void) {
+    if (!hottIsSending) {
+        hottIsSending = true;
+        // FIXME temorary workaround for HoTT not working on Hardware serial ports due to hardware/softserial serial port initialisation differences
+        if ((portConfig->identifier == SERIAL_PORT_USART1) || (portConfig->identifier == SERIAL_PORT_USART2) || (portConfig->identifier == SERIAL_PORT_USART3))
+            workAroundForHottTelemetryOnUsart(hottPort, MODE_TX);
+        else
+            serialSetMode(hottPort, MODE_TX);
+        hottMsgCrc = 0;
+        return;
+    }
+
+    if (hottMsgRemainingBytesToSendCount == 0) {
+        hottMsg = NULL;
+        hottIsSending = false;
+        // FIXME temorary workaround for HoTT not working on Hardware serial ports due to hardware/softserial serial port initialisation differences
+        if ((portConfig->identifier == SERIAL_PORT_USART1) || (portConfig->identifier == SERIAL_PORT_USART2) || (portConfig->identifier == SERIAL_PORT_USART3))
+            workAroundForHottTelemetryOnUsart(hottPort, MODE_RX);
+        else
+            serialSetMode(hottPort, MODE_RX);
+        flushHottRxBuffer();
+        return;
+    }
 
     --hottMsgRemainingBytesToSendCount;
-    if (hottMsgRemainingBytesToSendCount == 0) {
+    if(hottMsgRemainingBytesToSendCount == 0) {
         hottSerialWrite(hottMsgCrc++);
         return;
     }
@@ -527,7 +497,7 @@ static inline bool shouldPrepareHoTTMessages(uint32_t currentMicros)
     return currentMicros - lastMessagesPreparedAt >= HOTT_MESSAGE_PREPARATION_FREQUENCY_5_HZ;
 }
 
-static inline bool shouldCheckForHoTTRequest(void)
+static inline bool shouldCheckForHoTTRequest()
 {
     if (hottIsSending) {
         return false;
@@ -537,17 +507,16 @@ static inline bool shouldCheckForHoTTRequest(void)
 
 void checkHoTTTelemetryState(void)
 {
-    const bool newTelemetryEnabledValue = telemetryDetermineEnabledState(hottPortSharing);
+    bool newTelemetryEnabledValue = telemetryDetermineEnabledState(hottPortSharing);
 
     if (newTelemetryEnabledValue == hottTelemetryEnabled) {
         return;
     }
 
-    if (newTelemetryEnabledValue) {
+    if (newTelemetryEnabledValue)
         configureHoTTTelemetryPort();
-    } else {
+    else
         freeHoTTTelemetryPort();
-    }
 }
 
 void handleHoTTTelemetry(timeUs_t currentTimeUs)
@@ -571,7 +540,7 @@ void handleHoTTTelemetry(timeUs_t currentTimeUs)
         return;
 
     if (hottIsSending) {
-        if (currentTimeUs - serialTimer < HOTT_TX_DELAY_US) {
+        if(currentTimeUs - serialTimer < HOTT_TX_DELAY_US) {
             return;
         }
     }
